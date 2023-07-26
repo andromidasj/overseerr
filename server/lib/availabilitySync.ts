@@ -8,7 +8,6 @@ import { getRepository } from '@server/datasource';
 import Media from '@server/entity/Media';
 import MediaRequest from '@server/entity/MediaRequest';
 import type Season from '@server/entity/Season';
-import SeasonRequest from '@server/entity/SeasonRequest';
 import { User } from '@server/entity/User';
 import type { RadarrSettings, SonarrSettings } from '@server/lib/settings';
 import { getSettings } from '@server/lib/settings';
@@ -203,9 +202,6 @@ class AvailabilitySync {
             await this.mediaUpdater(media, true);
           }
         }
-        if (!mediaExists) {
-          await mediaRepository.save({ media, ...media });
-        }
       }
     } catch (ex) {
       logger.error('Failed to complete availability sync.', {
@@ -246,87 +242,55 @@ class AvailabilitySync {
     } while (mediaPage.length > 0);
   }
 
-  private findMediaStatus(
-    requests: MediaRequest[],
-    is4k: boolean
-  ): MediaStatus {
-    const filteredRequests = requests.filter(
-      (request) => request.is4k === is4k
-    );
-
-    let mediaStatus: MediaStatus;
-
-    if (
-      filteredRequests.some(
-        (request) => request.status === MediaRequestStatus.APPROVED
-      )
-    ) {
-      mediaStatus = MediaStatus.PROCESSING;
-    } else if (
-      filteredRequests.some(
-        (request) => request.status === MediaRequestStatus.PENDING
-      )
-    ) {
-      mediaStatus = MediaStatus.PENDING;
-    } else {
-      mediaStatus = MediaStatus.UNKNOWN;
-    }
-
-    return mediaStatus;
-  }
-
   private async mediaUpdater(media: Media, is4k: boolean): Promise<void> {
     const mediaRepository = getRepository(Media);
-    const requestRepository = getRepository(MediaRequest);
 
     try {
-      // Find all related requests only if
-      // the related media has an available status
-      const requests = await requestRepository
-        .createQueryBuilder('request')
-        .leftJoinAndSelect('request.media', 'media')
-        .where('(media.id = :id)', {
-          id: media.id,
-        })
-        .andWhere(
-          `(request.is4k = :is4k AND media.${
-            is4k ? 'status4k' : 'status'
-          } IN (:...mediaStatus))`,
-          {
-            mediaStatus: [
-              MediaStatus.AVAILABLE,
-              MediaStatus.PARTIALLY_AVAILABLE,
-            ],
-            is4k: is4k,
-          }
-        )
-        .getMany();
-
-      // Check if a season is processing or pending to
-      // make sure we set the media to the correct status
-      let mediaStatus = MediaStatus.UNKNOWN;
+      // If media type is tv, check if a season is processing
+      //to see if we need to keep the external metadata
+      let isMediaProcessing = false;
 
       if (media.mediaType === 'tv') {
-        mediaStatus = this.findMediaStatus(requests, is4k);
+        const requestRepository = getRepository(MediaRequest);
+
+        const request = await requestRepository
+          .createQueryBuilder('request')
+          .leftJoinAndSelect('request.media', 'media')
+          .where('(media.id = :id)', {
+            id: media.id,
+          })
+          .andWhere(
+            '(request.is4k = :is4k AND request.status = :requestStatus)',
+            {
+              requestStatus: MediaRequestStatus.APPROVED,
+              is4k: is4k,
+            }
+          )
+          .getOne();
+
+        if (request) {
+          isMediaProcessing = true;
+        }
       }
 
-      media[is4k ? 'status4k' : 'status'] = mediaStatus;
-      media[is4k ? 'serviceId4k' : 'serviceId'] =
-        mediaStatus === MediaStatus.PROCESSING
-          ? media[is4k ? 'serviceId4k' : 'serviceId']
-          : null;
+      // Set the non-4K or 4K media to deleted
+      // and change related columns to null if media
+      // is not processing
+      media[is4k ? 'status4k' : 'status'] = MediaStatus.DELETED;
+      media[is4k ? 'serviceId4k' : 'serviceId'] = isMediaProcessing
+        ? media[is4k ? 'serviceId4k' : 'serviceId']
+        : null;
       media[is4k ? 'externalServiceId4k' : 'externalServiceId'] =
-        mediaStatus === MediaStatus.PROCESSING
+        isMediaProcessing
           ? media[is4k ? 'externalServiceId4k' : 'externalServiceId']
           : null;
       media[is4k ? 'externalServiceSlug4k' : 'externalServiceSlug'] =
-        mediaStatus === MediaStatus.PROCESSING
+        isMediaProcessing
           ? media[is4k ? 'externalServiceSlug4k' : 'externalServiceSlug']
           : null;
-      media[is4k ? 'ratingKey4k' : 'ratingKey'] =
-        mediaStatus === MediaStatus.PROCESSING
-          ? media[is4k ? 'ratingKey4k' : 'ratingKey']
-          : null;
+      media[is4k ? 'ratingKey4k' : 'ratingKey'] = isMediaProcessing
+        ? media[is4k ? 'ratingKey4k' : 'ratingKey']
+        : null;
 
       logger.info(
         `The ${is4k ? '4K' : 'non-4K'} ${
@@ -338,13 +302,6 @@ class AvailabilitySync {
       );
 
       await mediaRepository.save({ media, ...media });
-
-      // Only delete media request if type is movie.
-      // Type tv request deletion is handled
-      // in the season request entity
-      if (requests.length > 0 && media.mediaType === 'movie') {
-        await requestRepository.remove(requests);
-      }
     } catch (ex) {
       logger.debug(
         `Failure updating the ${is4k ? '4K' : 'non-4K'} ${
@@ -364,35 +321,21 @@ class AvailabilitySync {
     is4k: boolean
   ): Promise<void> {
     const mediaRepository = getRepository(Media);
-    const seasonRequestRepository = getRepository(SeasonRequest);
 
+    // Filter out only the values that are false
+    // (media that should be deleted)
     const seasonsPendingRemoval = new Map(
       // Disabled linter as only the value is needed from the filter
       // eslint-disable-next-line @typescript-eslint/no-unused-vars
       [...seasons].filter(([_, exists]) => !exists)
     );
+    // Retrieve the season keys to pass into our log
     const seasonKeys = [...seasonsPendingRemoval.keys()];
 
     try {
-      // Need to check and see if there are any related season
-      // requests. If they are, we will need to delete them.
-      const seasonRequests = await seasonRequestRepository
-        .createQueryBuilder('seasonRequest')
-        .leftJoinAndSelect('seasonRequest.request', 'request')
-        .leftJoinAndSelect('request.media', 'media')
-        .where('(media.id = :id)', { id: media.id })
-        .andWhere(
-          '(request.is4k = :is4k AND seasonRequest.seasonNumber IN (:...seasonNumbers))',
-          {
-            seasonNumbers: seasonKeys,
-            is4k: is4k,
-          }
-        )
-        .getMany();
-
       for (const mediaSeason of media.seasons) {
         if (seasonsPendingRemoval.has(mediaSeason.seasonNumber)) {
-          mediaSeason[is4k ? 'status4k' : 'status'] = MediaStatus.UNKNOWN;
+          mediaSeason[is4k ? 'status4k' : 'status'] = MediaStatus.DELETED;
         }
       }
 
@@ -414,16 +357,12 @@ class AvailabilitySync {
 
       await mediaRepository.save({ media, ...media });
 
-      if (seasonRequests.length > 0) {
-        await seasonRequestRepository.remove(seasonRequests);
-      }
-
       logger.info(
         `The ${is4k ? '4K' : 'non-4K'} season(s) [${seasonKeys}] [TMDB ID ${
           media.tmdbId
         }] was not found in any ${
           media.mediaType === 'tv' ? 'Sonarr' : 'Radarr'
-        } and Plex instance. Status will be changed to unknown.`,
+        } and Plex instance. Status will be changed to deleted.`,
         { label: 'AvailabilitySync' }
       );
     } catch (ex) {
@@ -487,14 +426,6 @@ class AvailabilitySync {
       }
     }
 
-    if ((!radarr || !radarr.hasFile) && !existsInPlex) {
-      movieExists = false;
-    }
-
-    if ((!radarr4k || !radarr4k.hasFile) && !existsInPlex4k) {
-      movieExists4k = false;
-    }
-
     return existsInRadarr;
   }
 
@@ -546,25 +477,6 @@ class AvailabilitySync {
           );
         }
       }
-    }
-
-    if (
-      (!sonarr || sonarr.statistics.episodeFileCount === 0) &&
-      !existsInPlex
-    ) {
-      showExists = false;
-    }
-
-    if (
-      (!sonarr4k || sonarr4k.statistics.episodeFileCount === 0) &&
-      !existsInPlex4k
-    ) {
-      showExists4k = false;
-    }
-
-    // Here we check each season for availability
-    for (const season of media.seasons) {
-      await this.seasonExists(media, season, showExists, showExists4k);
     }
 
     // Here we check each season for availability
